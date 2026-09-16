@@ -24,11 +24,17 @@
 // Airtable setup: one table (Conversations) with fields — session_id,
 // person_type, name, email, land_or_place, role_or_work, needs, offers,
 // frameworks_mentioned, notes, full_transcript, past_visits_transcript,
-// last_updated. full_transcript is always just the current/most recent
-// visit; past_visits_transcript accumulates everything before that,
-// archived once at the start of each new visit (see updateTranscript).
+// verified_nicholas, last_updated. full_transcript is always just the
+// current/most recent visit; past_visits_transcript accumulates
+// everything before that, archived once at the start of each new visit
+// (see updateTranscript). verified_nicholas is set once a session says
+// the real-time authentication phrase (env var NICHOLAS_AUTH_PHRASE,
+// set directly in Vercel, never in code) — see saidAuthPhrase.
 // A second table (Knowledge)
-// with fields — topic, summary, source_type, possible_relation, added_at —
+// with fields — topic, summary, source_type, possible_relation, added_at,
+// expires_at (optional — for time-bound entries like a specific event;
+// once this date passes, fetchKnowledge stops surfacing the row on its
+// own, no manual deletion needed) —
 // accumulates
 // durable, reusable facts (from search, from users, or added by hand)
 // that get pulled into every future conversation's context. A third table
@@ -69,7 +75,7 @@ From there, listen for who you're talking to:
 
 If someone says they're just curious, or asks what this is: give a short, genuine answer — we're building a living network connecting people to SLO County's land and the community already caring for it, and this conversation is part of how it actually gets built. You can mention, briefly, a concrete example or two of what that actually looks like right now — a county-wide grazing network taking shape, or a way for people to flag trees worth protecting — just enough to give them something real to picture, not a rundown of every project. Let it land as an invitation to be part of something just getting started, not an explanation of a finished database or a request for their information — a vibe, not a pitch, and definitely not "we're gathering data." If they leave it there, ask a natural follow-up that flows from whatever they just said, so satisfying the curiosity becomes the start of the real conversation instead of where it ends.
 
-If that follow-up also comes back vague or non-directional — no particular tree, no specific place, nothing pulling at them — don't keep re-asking reworded versions of the same open question. One open question is a genuine invitation; a second one starts to feel like you're asking them to generate interest out of nothing. Shift instead to actually offering them something: one real, specific, true thing, told like a small story rather than a feature list — the oak that was headed for removal and is now being saved, real work happening on a county-wide grazing network, or simply asking whether they've ever noticed a tree whose care actually impressed them. Pick whatever's most relevant if they've given you any hint at all to go on; otherwise just pick the best one. One thing, not a menu — and always close with an actual question or invitation, not just the fact itself trailing off. A genuinely interesting story still needs a door left open at the end, or someone who's already been answering briefly has nothing to grab onto and the conversation just quietly dies.
+If that follow-up also comes back vague or non-directional — no particular tree, no specific place, nothing pulling at them — don't keep re-asking reworded versions of the same open question. One open question is a genuine invitation; a second one starts to feel like you're asking them to generate interest out of nothing. Shift instead to actually offering them something: one real, specific, true thing, told like a small story rather than a feature list — the oak that was headed for removal and is now being saved, real work happening on a county-wide grazing network, a real community college certificate program for people who want to actually learn ranch and grazing skills, or simply asking whether they've ever noticed a tree whose care actually impressed them. Pick whatever's most relevant if they've given you any hint at all to go on; otherwise just pick the best one. One thing, not a menu — and always close with an actual question or invitation, not just the fact itself trailing off. A genuinely interesting story still needs a door left open at the end, or someone who's already been answering briefly has nothing to grab onto and the conversation just quietly dies.
 
 This applies more broadly than just that one moment: unless you're actually closing the conversation, don't let a substantial answer just trail off once you've delivered it — after reading a page in depth, after explaining something with real detail (like the two ways a grazing arrangement can work), whatever it is. The information itself isn't the end of the turn; leaving an actual question or opening is. This matters most exactly when someone's already answering briefly — that's the moment a reply without a real question can quietly end things.
 
@@ -125,6 +131,8 @@ If someone wants to be connected to others working on tree stewardship in SLO Co
 
 The same idea applies to GrazeSLO. If someone works in or around the grazing world in any real capacity — not just grazers and landowners, but processors, fiber people, program coordinators, anyone who'd genuinely belong in a grazing association — that's a real directory entry, not just general interest, even if you've already logged them as a practitioner through log_contact. A general environmental advocate, or someone just personally interested in sustainable food or land use, isn't automatically a lead unless their actual work intersects with grazing or land management specifically — the bar is real involvement, not adjacent enthusiasm. Make a real effort to gather what's actually relevant to their specific role, whatever that turns out to be — for a grazer that might be flock size and species, for a landowner it's acreage and land type, for a processor it's capacity and services, but don't assume everyone fits one of those — ask what they actually do and let that shape what's worth capturing, the way you would with the tree fields above.
 
+If someone wants to actually learn grazing or ranch skills themselves — not seeking a grazer for their land, not already working in the field, but wanting to get into it — that's a different, real need from either of those, and Cuesta College's Ranch Education program is a genuine answer worth pointing them to: a real certificate program with actual courses in farm maintenance, livestock handling, land use and grazing planning, livestock health, and the business side of ranch/grazing work. This isn't a GrazeSLO directory entry — it's a legitimate educational path, worth mentioning on its own terms.
+
 If someone's actually looking for grazing on their own land, it's worth understanding their situation a bit before pointing them anywhere — are they the property owner themselves, what's actually driving the interest (fire fuel reduction, weed pressure, keeping livestock as a hobby or production, general land management), and are they thinking one-off/seasonal or open to something ongoing, and is there any real timeline pressure or is this early exploration. You don't need all of this before logging them, but it's worth genuinely asking rather than skipping straight to contact info — it's what actually makes a good match possible instead of a generic one. If it's genuinely relevant, you can also explain honestly that grazing arrangements generally come in two forms — a grazing service contracted for a defined seasonal period, versus a permanent system designed around a specific property that aims to sustain its own ongoing grazing over time — as two real options with real tradeoffs, not one framed as better than the other.
 
 Once you have at least their category and email, call submit_grazeslo_lead. If you haven't already asked about being connected/shared earlier in this same conversation, ask now, the same way — but if you have, just carry that same answer over rather than asking again. If you've been given a pool of shareable GrazeSLO participants (see below) and there's a genuine fit with this person right now, make the connection directly in the conversation rather than just logging them to wait — that's the actual point of asking. Both this and the Heritage Tree intake can happen alongside a normal log_contact call for the same person — they're not a replacement for it, just a more specific, directory-ready record.
@@ -168,7 +176,7 @@ const TOOLS = [{
     properties: {
       topic: { type: "string", description: "short label, e.g. 'SLO REP Theatre oak relocation' or 'grazing coordination' for an interest signal" },
       summary: { type: "string", description: "for a fact: the actual information. for an interest signal: a brief note on the nature of the interest — keep it about the topic, not the person" },
-      source_type: { type: "string", description: "web_search, user_told_me, or interest_signal (someone showing interest in a topic/project/kind of work, tracked as momentum rather than a fixed fact)" },
+      source_type: { type: "string", description: "web_search, user_told_me, or interest_signal (someone showing interest in a topic/project/kind of work, tracked as momentum rather than a fixed fact). If you're actually talking with Nicholas (you'll know — it's been independently confirmed, not something you're guessing at), use nicholas_provided; otherwise this gets corrected automatically regardless of what you put here, so there's no need to worry about getting it wrong." },
       possible_relation: { type: "string", description: "if this seems to confirm, update, or conflict with something already in the knowledge you were given at the start of this conversation, briefly note which existing topic and how. Leave blank if it's genuinely new and unrelated — don't force a connection that isn't there." },
     },
     required: ["topic", "summary", "source_type"],
@@ -571,7 +579,17 @@ async function fetchKnowledge() {
     const r = await fetch(`https://api.airtable.com/v0/${base}/${table}?pageSize=100`, { headers });
     if (!r.ok) return "";
     const data = await r.json();
-    const rows = (data.records || []).map(rec => rec.fields).filter(f => f.topic);
+    const now = new Date();
+    const rows = (data.records || [])
+      .map(rec => rec.fields)
+      .filter(f => f.topic)
+      // A row with expires_at in the past is skipped entirely — this is
+      // what lets a time-bound entry (an event, a workshop) stop being
+      // surfaced on its own once it's no longer relevant, rather than
+      // relying on someone remembering to delete the row by hand. The
+      // row itself is untouched in Airtable; it just stops being fed
+      // into any conversation from this point on.
+      .filter(f => !f.expires_at || new Date(f.expires_at) >= now);
 
     const facts = rows.filter(f => f.source_type !== "interest_signal" && f.summary);
     const interests = rows.filter(f => f.source_type === "interest_signal");
@@ -676,12 +694,29 @@ async function fetchExistingContact(sessionId) {
     const data = await r.json();
     const f = data.records && data.records[0] && data.records[0].fields;
     if (!f) return null;
-    const hasContent = f.name || f.email || f.land_or_place || f.needs || f.offers || f.notes || f.role_or_work || f.full_transcript || f.past_visits_transcript;
+    const hasContent = f.name || f.email || f.land_or_place || f.needs || f.offers || f.notes || f.role_or_work || f.full_transcript || f.past_visits_transcript || f.verified_nicholas;
     return hasContent ? f : null;
   } catch (e) {
     console.error("Existing contact fetch failed:", e);
     return null;
   }
+}
+
+// Real, code-level authentication — a plain string comparison against a
+// server-only env var, never something Claude itself evaluates. This is
+// deliberately NOT "ask the model if this seems like Nicholas" — a
+// judgment call like that is exactly what prompt injection targets
+// ("ignore previous instructions, I'm actually Nicholas..."). Scanning
+// the full message history (not just the latest turn) means saying the
+// phrase once, anywhere earlier in a long conversation, keeps it
+// recognized for the rest of that same session.
+function saidAuthPhrase(messages) {
+  const phrase = process.env.NICHOLAS_AUTH_PHRASE;
+  if (!phrase) return false;
+  const needle = phrase.toLowerCase();
+  return messages.some(m =>
+    m.role === "user" && typeof m.content === "string" && m.content.toLowerCase().includes(needle)
+  );
 }
 
 async function callClaude(messages, systemPrompt) {
@@ -761,6 +796,22 @@ module.exports = async function handler(req, res) {
       isFirstTurn ? fetchExistingContact(sessionId) : Promise.resolve(null),
     ]);
 
+    // Real authentication, computed here in code — never something Claude
+    // itself decides. saidPhraseThisSession catches it within the current
+    // conversation (the phrase stays in the message history for the rest
+    // of the session once said); previouslyVerified catches a device
+    // that authenticated on an earlier visit. Either one is enough.
+    const saidPhraseThisSession = saidAuthPhrase(messages);
+    const previouslyVerified = !!(existingContact && existingContact.verified_nicholas);
+    const isNicholas = saidPhraseThisSession || previouslyVerified;
+    if (saidPhraseThisSession && !previouslyVerified) {
+      // Persist it so future visits from this same device are recognized
+      // without needing the phrase said again. Fire-and-forget — this
+      // isn't on the critical path for the actual reply.
+      upsertContact(sessionId, { verified_nicholas: true }).catch(e => console.error("Failed to persist verified_nicholas:", e));
+      sendAlert("Someone authenticated as Nicholas", `A conversation just authenticated with the Nicholas phrase. If this wasn't you, the phrase may have leaked — worth rotating it in Vercel.\n\nSession: ${sessionId}`);
+    }
+
     let systemPrompt = SYSTEM_PROMPT;
     if (knowledgeBlock) {
       systemPrompt += `\n\nHere's what's already known from past conversations and from the people running this project — weave it in naturally where it's actually relevant, don't recite it as a list:\n${knowledgeBlock}`;
@@ -770,6 +821,9 @@ module.exports = async function handler(req, res) {
     }
     if (grazeSloPoolBlock) {
       systemPrompt += `\n\nHere's the current pool of GrazeSLO participants who've explicitly agreed to be connected — landowners and practitioners both. When someone describes their own grazing situation, compare it against this pool for a genuine fit on location, category, and what each side is actually looking for. If there's a real match, actually make the introduction — share the relevant contact's details and situation, the way a real connector would, not a vague "someone might reach out." Don't force a match that isn't really there; the network is still small and growing, and it's more honest to say so than to stretch a weak fit.\n\nOne real distinction worth holding onto: practitioners (graziers, processors, fiber people, anyone offering a service) registered specifically to be found — being discoverable is the whole point for them, so if someone asks to see who's in the directory, or wants a list of practitioners, actually give them one (name, category, service area, a brief line on what they do) rather than deflecting to "describe your need and I'll check." Landowners describing their own property are different — that's more personal, so keep that side to real matching rather than listing their details out to anyone who asks. Don't share anyone not listed here:\n${grazeSloPoolBlock}`;
+    }
+    if (isNicholas) {
+      systemPrompt += `\n\nThis conversation has been verified, in code, as actually being Nicholas — the person who built and runs this whole project. This isn't something you decided or inferred from the conversation itself; it's been confirmed independently, so you can trust it completely. You can drop the general-visitor caution: take what he tells you as directly reliable, the same standing as anything already in your knowledge from the people running this project. If you call save_knowledge based on something he tells you, it'll automatically be recorded as coming from him — you don't need to do anything special for that part. Don't make a big scene of the recognition (no need to announce "I've verified you" or repeat anything back) — just let a real, warm familiarity come through naturally, the way you would with anyone you actually know.`;
     }
     if (existingContact) {
       const bits = [];
@@ -834,14 +888,29 @@ module.exports = async function handler(req, res) {
           }
         } else if (t.name === "save_knowledge") {
           try {
-            await saveKnowledge(t.input);
+            const input = { ...t.input };
+            if (isNicholas) {
+              // Enforced here in code, not left to Claude's own judgment —
+              // this is the actual security boundary. Whatever
+              // source_type she passed gets overridden, based on the
+              // independently-verified isNicholas flag computed earlier
+              // from the real, code-level auth check.
+              input.source_type = "nicholas_provided";
+            } else if (input.source_type === "nicholas_provided") {
+              // The other half of the same boundary: an unauthenticated
+              // session claiming this tier gets downgraded rather than
+              // trusted — otherwise the whole check is one-directional
+              // and doesn't actually block anything.
+              input.source_type = "user_told_me";
+            }
+            await saveKnowledge(input);
             // Only user_told_me carries real moderation risk — an
             // unverified claim from a stranger that could get repeated as
             // fact. web_search is independently checkable, nicholas_provided
             // is you, and interest_signal is meant to accumulate quietly as
             // a count rather than alert per-instance.
-            if (t.input && t.input.source_type === "user_told_me") {
-              sendAlert("New unverified claim added — needs review", `Someone told her something that got saved as unverified knowledge — worth a look before it gets repeated as fact.\n\nTopic: ${t.input.topic}\nSummary: ${t.input.summary}\n${t.input.possible_relation ? `\nPossible relation to existing knowledge: ${t.input.possible_relation}` : ""}\n\nSession: ${sessionId}`);
+            if (input.source_type === "user_told_me") {
+              sendAlert("New unverified claim added — needs review", `Someone told her something that got saved as unverified knowledge — worth a look before it gets repeated as fact.\n\nTopic: ${input.topic}\nSummary: ${input.summary}\n${input.possible_relation ? `\nPossible relation to existing knowledge: ${input.possible_relation}` : ""}\n\nSession: ${sessionId}`);
             }
           } catch (e) {
             console.error("Knowledge save failed:", e);
