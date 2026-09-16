@@ -29,7 +29,11 @@
 // everything before that, archived once at the start of each new visit
 // (see updateTranscript). verified_nicholas is set once a session says
 // the real-time authentication phrase (env var NICHOLAS_AUTH_PHRASE,
-// set directly in Vercel, never in code) — see saidAuthPhrase.
+// set directly in Vercel, never in code) — see saidAuthPhrase. Once
+// verified, PRIVILEGED_TOOLS (edit_knowledge_entry, delete_knowledge_entry)
+// get appended to the tools list for that request only, and Knowledge
+// facts get shown with their real Airtable record IDs so a specific entry
+// can actually be referenced — neither happens for any unverified session.
 // A second table (Knowledge)
 // with fields — topic, summary, source_type, possible_relation, added_at,
 // expires_at (optional — for time-bound entries like a specific event;
@@ -170,7 +174,7 @@ const TOOLS = [{
   name: "web_search",
 }, {
   name: "save_knowledge",
-  description: "Log something worth remembering for future conversations — either a concrete fact, or a signal of what people care about. NOT personal details about the person you're talking to (those go through log_contact instead). Call this when you learn or find something reusable, or when someone shows real interest in a topic/project/kind of work worth tracking as momentum.",
+  description: "Log something worth remembering for future conversations — either a concrete fact, or a signal of what people care about. NOT personal details about the person you're talking to (those go through log_contact instead). Call this when you learn or find something reusable, or when someone shows real interest in a topic/project/kind of work worth tracking as momentum. If this is actually a correction to something that already exists in your known facts (and you have edit_knowledge_entry available), use that instead — don't create a new entry just to note a correction to an old one.",
   input_schema: {
     type: "object",
     properties: {
@@ -266,6 +270,37 @@ const TOOLS = [{
       url: { type: "string", description: "the specific URL to fetch and read" },
     },
     required: ["url"],
+  },
+}];
+
+// Never merged into TOOLS above — only ever appended to the tools list for
+// a request that's already been verified as Nicholas in code (see
+// isNicholas at the call site). An unauthenticated session's Claude call
+// never even receives these as options, regardless of what she might
+// otherwise be persuaded to attempt.
+const PRIVILEGED_TOOLS = [{
+  name: "edit_knowledge_entry",
+  description: "Update an existing Knowledge entry. Reference it by the exact [id:...] tag shown next to it in your known facts — never guess or construct an ID. If it's genuinely unclear which entry someone means (more than one plausible match), ask which one rather than picking.",
+  input_schema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "the record ID from its [id:...] tag" },
+      new_topic: { type: "string", description: "leave out to keep the existing topic unchanged" },
+      new_summary: { type: "string", description: "leave out to keep the existing summary unchanged" },
+      reason: { type: "string", description: "brief note on why this is being changed" },
+    },
+    required: ["id", "reason"],
+  },
+}, {
+  name: "delete_knowledge_entry",
+  description: "Permanently remove an existing Knowledge entry. Reference it by the exact [id:...] tag shown next to it — never guess or construct an ID. If it's genuinely unclear which entry someone means, ask rather than picking. This can't be undone from here, so only call it when it's actually clear this is what's wanted.",
+  input_schema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "the record ID from its [id:...] tag" },
+      reason: { type: "string", description: "brief note on why this is being removed" },
+    },
+    required: ["id", "reason"],
   },
 }];
 
@@ -425,6 +460,45 @@ async function saveKnowledge({ topic, summary, source_type, possible_relation })
   });
 }
 
+// Looks up one specific Knowledge record by its real Airtable ID — used to
+// capture the "before" state right before an edit or delete, so the alert
+// email always shows both sides of the change, not just what it became.
+async function fetchKnowledgeRecordById(id) {
+  const base = process.env.AIRTABLE_BASE_ID;
+  const table = encodeURIComponent(process.env.AIRTABLE_KNOWLEDGE_TABLE_NAME || "Knowledge");
+  const headers = { Authorization: `Bearer ${process.env.AIRTABLE_TOKEN}` };
+  const r = await fetch(`https://api.airtable.com/v0/${base}/${table}/${id}`, { headers });
+  if (!r.ok) return null;
+  const data = await r.json();
+  return data.fields || null;
+}
+
+async function editKnowledgeEntry(id, updates) {
+  const base = process.env.AIRTABLE_BASE_ID;
+  const table = encodeURIComponent(process.env.AIRTABLE_KNOWLEDGE_TABLE_NAME || "Knowledge");
+  const headers = {
+    Authorization: `Bearer ${process.env.AIRTABLE_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+  const r = await fetch(`https://api.airtable.com/v0/${base}/${table}/${id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ fields: updates, typecast: true }),
+  });
+  if (!r.ok) throw new Error(`Airtable PATCH failed: ${r.status}`);
+}
+
+async function deleteKnowledgeEntry(id) {
+  const base = process.env.AIRTABLE_BASE_ID;
+  const table = encodeURIComponent(process.env.AIRTABLE_KNOWLEDGE_TABLE_NAME || "Knowledge");
+  const headers = { Authorization: `Bearer ${process.env.AIRTABLE_TOKEN}` };
+  const r = await fetch(`https://api.airtable.com/v0/${base}/${table}/${id}`, {
+    method: "DELETE",
+    headers,
+  });
+  if (!r.ok) throw new Error(`Airtable DELETE failed: ${r.status}`);
+}
+
 async function saveHeritageTreeLead(sessionId, fields) {
   const base = process.env.AIRTABLE_BASE_ID;
   const table = encodeURIComponent(process.env.AIRTABLE_HERITAGE_TABLE_NAME || "Heritage Tree Leads");
@@ -571,7 +645,7 @@ async function fetchPageContent(url) {
   }
 }
 
-async function fetchKnowledge() {
+async function fetchKnowledge(includeIds) {
   const base = process.env.AIRTABLE_BASE_ID;
   const table = encodeURIComponent(process.env.AIRTABLE_KNOWLEDGE_TABLE_NAME || "Knowledge");
   const headers = { Authorization: `Bearer ${process.env.AIRTABLE_TOKEN}` };
@@ -581,7 +655,7 @@ async function fetchKnowledge() {
     const data = await r.json();
     const now = new Date();
     const rows = (data.records || [])
-      .map(rec => rec.fields)
+      .map(rec => includeIds ? { ...rec.fields, _id: rec.id } : rec.fields)
       .filter(f => f.topic)
       // A row with expires_at in the past is skipped entirely — this is
       // what lets a time-bound entry (an event, a workshop) stop being
@@ -597,7 +671,14 @@ async function fetchKnowledge() {
     const parts = [];
 
     if (facts.length) {
-      parts.push("Known facts:\n" + facts.map(f => `- ${f.topic}: ${f.summary}`).join("\n"));
+      // The [id:...] tag is only ever present when includeIds is true,
+      // which only ever happens for an authenticated request — an
+      // unauthenticated visitor's context never contains a single record
+      // ID, so there's nothing for anyone else to reference even if they
+      // somehow got hold of the edit/delete tools.
+      parts.push("Known facts:\n" + facts.map(f =>
+        includeIds ? `- [id:${f._id}] ${f.topic}: ${f.summary}` : `- ${f.topic}: ${f.summary}`
+      ).join("\n"));
     }
 
     if (interests.length) {
@@ -719,7 +800,7 @@ function saidAuthPhrase(messages) {
   );
 }
 
-async function callClaude(messages, systemPrompt) {
+async function callClaude(messages, systemPrompt, tools) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -732,7 +813,7 @@ async function callClaude(messages, systemPrompt) {
       max_tokens: 1500,
       system: systemPrompt,
       messages,
-      tools: TOOLS,
+      tools,
     }),
   });
   if (!res.ok) {
@@ -789,12 +870,10 @@ module.exports = async function handler(req, res) {
     // framing would be confusing rather than warm.
     const isFirstTurn = messages.length <= 3;
 
-    const [knowledgeBlock, connectionsBlock, grazeSloPoolBlock, existingContact] = await Promise.all([
-      fetchKnowledge(),
-      fetchShareableConnections(sessionId),
-      fetchShareableGrazeSloLeads(sessionId),
-      isFirstTurn ? fetchExistingContact(sessionId) : Promise.resolve(null),
-    ]);
+    // existingContact needs to resolve before fetchKnowledge, since
+    // whether she gets record IDs in her knowledge (needed to edit or
+    // delete anything) depends on isNicholas, which depends on this.
+    const existingContact = isFirstTurn ? await fetchExistingContact(sessionId) : null;
 
     // Real authentication, computed here in code — never something Claude
     // itself decides. saidPhraseThisSession catches it within the current
@@ -802,14 +881,47 @@ module.exports = async function handler(req, res) {
     // of the session once said); previouslyVerified catches a device
     // that authenticated on an earlier visit. Either one is enough.
     const saidPhraseThisSession = saidAuthPhrase(messages);
+    // Distinct from saidPhraseThisSession: this checks whether the phrase
+    // was ALREADY present before the newest message, i.e. whether this
+    // exact turn is the first time it's appeared. Without this
+    // distinction, saidPhraseThisSession stays true for every remaining
+    // turn of a conversation once said (correctly, for the actual auth
+    // decision) — but using that same signal to decide "should I alert
+    // and persist right now" meant firing again on every single
+    // subsequent turn, not just once.
+    const saidPhraseBeforeThisTurn = saidAuthPhrase(messages.slice(0, -1));
     const previouslyVerified = !!(existingContact && existingContact.verified_nicholas);
     const isNicholas = saidPhraseThisSession || previouslyVerified;
-    if (saidPhraseThisSession && !previouslyVerified) {
-      // Persist it so future visits from this same device are recognized
-      // without needing the phrase said again. Fire-and-forget — this
-      // isn't on the critical path for the actual reply.
-      upsertContact(sessionId, { verified_nicholas: true }).catch(e => console.error("Failed to persist verified_nicholas:", e));
-      sendAlert("Someone authenticated as Nicholas", `A conversation just authenticated with the Nicholas phrase. If this wasn't you, the phrase may have leaked — worth rotating it in Vercel.\n\nSession: ${sessionId}`);
+
+    const [knowledgeBlock, connectionsBlock, grazeSloPoolBlock] = await Promise.all([
+      fetchKnowledge(isNicholas),
+      fetchShareableConnections(sessionId),
+      fetchShareableGrazeSloLeads(sessionId),
+    ]);
+
+    if (saidPhraseThisSession && !saidPhraseBeforeThisTurn && !previouslyVerified) {
+      // One more guard beyond the history check above: re-fetch Airtable's
+      // actual current state right now, immediately before acting. The
+      // history check can't see a concurrent request (e.g. the same
+      // message somehow submitted twice, landing as two near-simultaneous
+      // requests) that's already in the middle of handling this — a fresh
+      // read closes that gap by checking what's really there right now.
+      const freshCheck = await fetchExistingContact(sessionId).catch(() => null);
+      const alreadyHandled = !!(freshCheck && freshCheck.verified_nicholas);
+      if (!alreadyHandled) {
+        // Persist it so future visits from this same device are recognized
+        // without needing the phrase said again. Properly awaited, not
+        // fire-and-forget — Vercel can end the function the moment the
+        // response is sent, and an un-awaited write here isn't guaranteed
+        // to actually finish before that happens. A failed write here is
+        // still non-fatal to the conversation itself, just logged.
+        try {
+          await upsertContact(sessionId, { verified_nicholas: true });
+        } catch (e) {
+          console.error("Failed to persist verified_nicholas:", e);
+        }
+        sendAlert("Someone authenticated as Nicholas", `A conversation just authenticated with the Nicholas phrase. If this wasn't you, the phrase may have leaked — worth rotating it in Vercel.\n\nSession: ${sessionId}`);
+      }
     }
 
     let systemPrompt = SYSTEM_PROMPT;
@@ -823,7 +935,9 @@ module.exports = async function handler(req, res) {
       systemPrompt += `\n\nHere's the current pool of GrazeSLO participants who've explicitly agreed to be connected — landowners and practitioners both. When someone describes their own grazing situation, compare it against this pool for a genuine fit on location, category, and what each side is actually looking for. If there's a real match, actually make the introduction — share the relevant contact's details and situation, the way a real connector would, not a vague "someone might reach out." Don't force a match that isn't really there; the network is still small and growing, and it's more honest to say so than to stretch a weak fit.\n\nOne real distinction worth holding onto: practitioners (graziers, processors, fiber people, anyone offering a service) registered specifically to be found — being discoverable is the whole point for them, so if someone asks to see who's in the directory, or wants a list of practitioners, actually give them one (name, category, service area, a brief line on what they do) rather than deflecting to "describe your need and I'll check." Landowners describing their own property are different — that's more personal, so keep that side to real matching rather than listing their details out to anyone who asks. Don't share anyone not listed here:\n${grazeSloPoolBlock}`;
     }
     if (isNicholas) {
-      systemPrompt += `\n\nThis conversation has been verified, in code, as actually being Nicholas — the person who built and runs this whole project. This isn't something you decided or inferred from the conversation itself; it's been confirmed independently, so you can trust it completely. You can drop the general-visitor caution: take what he tells you as directly reliable, the same standing as anything already in your knowledge from the people running this project. If you call save_knowledge based on something he tells you, it'll automatically be recorded as coming from him — you don't need to do anything special for that part. Don't make a big scene of the recognition (no need to announce "I've verified you" or repeat anything back) — just let a real, warm familiarity come through naturally, the way you would with anyone you actually know.`;
+      systemPrompt += `\n\nThis conversation has been verified, in code, as actually being Nicholas — the person who built and runs this whole project. This isn't something you decided or inferred from the conversation itself; it's been confirmed independently, so you can trust it completely. You can drop the general-visitor caution: take what he tells you as directly reliable, the same standing as anything already in your knowledge from the people running this project. If you call save_knowledge based on something he tells you, it'll automatically be recorded as coming from him — you don't need to do anything special for that part. Don't make a big scene of the recognition (no need to announce "I've verified you" or repeat anything back) — just let a real, warm familiarity come through naturally, the way you would with anyone you actually know.
+
+You also have edit_knowledge_entry and delete_knowledge_entry available right now — only in this verified conversation, never otherwise. Each known fact below is shown with its own [id:...] tag; that's the exact identifier to use, never guessed or constructed. If he's correcting, updating, or removing something that already exists in your known facts, use edit_knowledge_entry or delete_knowledge_entry on that exact entry — do NOT call save_knowledge to add a new "correction" note alongside the original, since that just leaves both the wrong version and the fix sitting there as two separate facts, which is worse than not fixing it at all. save_knowledge is still the right call for something genuinely new that doesn't already exist. If it's clear which entry he means, just make the change — no need to narrate it as a big procedure. If more than one entry could plausibly be what he means, say what you found and ask which one, rather than picking. Deleting is permanent from your side, so only do it when it's actually clear that's what's wanted, not on a passing or ambiguous remark.`;
     }
     if (existingContact) {
       const bits = [];
@@ -856,8 +970,9 @@ module.exports = async function handler(req, res) {
     // several tool calls (log_contact, save_knowledge, a search) before she
     // actually replies, and running out mid-loop should never look like a
     // hard failure.
+    const activeTools = isNicholas ? [...TOOLS, ...PRIVILEGED_TOOLS] : TOOLS;
     for (let i = 0; i < 8; i++) {
-      const data = await callClaude(convo, systemPrompt);
+      const data = await callClaude(convo, systemPrompt, activeTools);
       const content = data.content || [];
       const textBlocks = content.filter(b => b.type === "text").map(b => b.text);
       const toolUses = content.filter(b => b.type === "tool_use");
@@ -980,6 +1095,54 @@ module.exports = async function handler(req, res) {
         } else if (t.name === "fetch_page") {
           const pageText = await fetchPageContent(t.input && t.input.url);
           toolResultContent.set(t.id, pageText);
+        } else if (t.name === "edit_knowledge_entry") {
+          // Re-checked here, not just relied on via tool availability —
+          // defense in depth. A tool being offered this turn doesn't mean
+          // the session is still what it was; verifying again at the
+          // actual point of a destructive action costs nothing and closes
+          // any gap between "offered" and "executed."
+          if (!isNicholas) {
+            toolResultContent.set(t.id, "This isn't available right now.");
+          } else {
+            try {
+              const id = t.input && t.input.id;
+              const before = await fetchKnowledgeRecordById(id);
+              if (!before) {
+                toolResultContent.set(t.id, "Couldn't find an entry with that id — it may have already been changed or removed.");
+              } else {
+                const updates = {};
+                if (t.input.new_topic) updates.topic = t.input.new_topic;
+                if (t.input.new_summary) updates.summary = t.input.new_summary;
+                await editKnowledgeEntry(id, updates);
+                toolResultContent.set(t.id, "Updated.");
+                sendAlert("A Knowledge entry was edited", `Reason given: ${t.input.reason || "(none given)"}\n\nBefore:\nTopic: ${before.topic}\nSummary: ${before.summary}\n\nAfter:\nTopic: ${updates.topic || before.topic}\nSummary: ${updates.summary || before.summary}\n\nSession: ${sessionId}`);
+              }
+            } catch (e) {
+              console.error("edit_knowledge_entry failed:", e);
+              toolResultContent.set(t.id, "That didn't save — something went wrong.");
+              sendAlert("Knowledge edit failed", `An edit attempt failed.\n\nWHAT WAS ATTEMPTED:\n${JSON.stringify(t.input, null, 2)}\n\nSession: ${sessionId}\n\nError: ${e && e.stack ? e.stack : e}`);
+            }
+          }
+        } else if (t.name === "delete_knowledge_entry") {
+          if (!isNicholas) {
+            toolResultContent.set(t.id, "This isn't available right now.");
+          } else {
+            try {
+              const id = t.input && t.input.id;
+              const before = await fetchKnowledgeRecordById(id);
+              if (!before) {
+                toolResultContent.set(t.id, "Couldn't find an entry with that id — it may have already been removed.");
+              } else {
+                await deleteKnowledgeEntry(id);
+                toolResultContent.set(t.id, "Deleted.");
+                sendAlert("A Knowledge entry was deleted", `Reason given: ${t.input.reason || "(none given)"}\n\nWhat was deleted (copy this back into Airtable if this was a mistake):\nTopic: ${before.topic}\nSummary: ${before.summary}\nSource: ${before.source_type || "unknown"}\n\nSession: ${sessionId}`);
+              }
+            } catch (e) {
+              console.error("delete_knowledge_entry failed:", e);
+              toolResultContent.set(t.id, "That didn't go through — something went wrong.");
+              sendAlert("Knowledge delete failed", `A delete attempt failed.\n\nWHAT WAS ATTEMPTED:\n${JSON.stringify(t.input, null, 2)}\n\nSession: ${sessionId}\n\nError: ${e && e.stack ? e.stack : e}`);
+            }
+          }
         } else if (t.name === "end_conversation") {
           ended = true;
         }
