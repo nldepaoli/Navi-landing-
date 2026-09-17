@@ -873,18 +873,13 @@ module.exports = async function handler(req, res) {
     // existingContact needs to resolve before fetchKnowledge, since
     // whether she gets record IDs in her knowledge (needed to edit or
     // delete anything) depends on isNicholas, which depends on this.
-    const existingContact = isFirstTurn ? await fetchExistingContact(sessionId) : null;
-
-    // TEMPORARY diagnostic — remove once the verified_nicholas persistence
-    // issue is actually resolved. Unconditional on isFirstTurn (not gated
-    // on existingContact or verified_nicholas) specifically so silence
-    // can't be misread — the previous version's silence was ambiguous
-    // between "nothing found" and "found, and correctly verified," which
-    // are opposite outcomes. This version always reports the literal
-    // truth: exactly what existingContact is, whatever that turns out to be.
-    if (isFirstTurn) {
-      sendAlert("DEBUG: first-turn existingContact check", `session_id: ${sessionId}\n\nexistingContact was: ${existingContact === null ? "null (nothing found at all)" : JSON.stringify(existingContact, null, 2)}`);
-    }
+    // Fetched on every turn now, not just isFirstTurn — the auth check
+    // below needs this to be correct for the whole conversation, not just
+    // its first message. The welcome-back context injection further down
+    // still only fires on isFirstTurn specifically, so this doesn't
+    // repeat that content on every turn — it just makes the underlying
+    // data available consistently for both purposes.
+    const existingContact = await fetchExistingContact(sessionId);
 
     // Real authentication, computed here in code — never something Claude
     // itself decides. saidPhraseThisSession catches it within the current
@@ -903,6 +898,16 @@ module.exports = async function handler(req, res) {
     const saidPhraseBeforeThisTurn = saidAuthPhrase(messages.slice(0, -1));
     const previouslyVerified = !!(existingContact && existingContact.verified_nicholas);
     const isNicholas = saidPhraseThisSession || previouslyVerified;
+
+    // TEMPORARY diagnostic — remove once the multi-turn persistence issue
+    // is actually confirmed resolved. Scoped to authentication-relevant
+    // conversations only (not every conversation), so it isn't noisy for
+    // ordinary visitors, and now fires on every turn of one, not just the
+    // first — the bug just found was specifically about turns after the
+    // first, so this needs to check throughout, not just at the start.
+    if (saidPhraseThisSession || previouslyVerified || (existingContact && existingContact.verified_nicholas)) {
+      sendAlert("DEBUG: existingContact check (turn " + messages.length + ")", `session_id: ${sessionId}\nisFirstTurn: ${isFirstTurn}\nsaidPhraseThisSession: ${saidPhraseThisSession}\npreviouslyVerified (as computed this turn): ${previouslyVerified}\nisNicholas (final): ${isNicholas}\n\nexistingContact was: ${existingContact === null ? "null (nothing found at all)" : JSON.stringify(existingContact, null, 2)}`);
+    }
 
     const [knowledgeBlock, connectionsBlock, grazeSloPoolBlock] = await Promise.all([
       fetchKnowledge(isNicholas),
@@ -950,7 +955,7 @@ module.exports = async function handler(req, res) {
 
 You also have edit_knowledge_entry and delete_knowledge_entry available right now — only in this verified conversation, never otherwise. Each known fact below is shown with its own [id:...] tag; that's the exact identifier to use, never guessed or constructed. If he's correcting, updating, or removing something that already exists in your known facts, use edit_knowledge_entry or delete_knowledge_entry on that exact entry — do NOT call save_knowledge to add a new "correction" note alongside the original, since that just leaves both the wrong version and the fix sitting there as two separate facts, which is worse than not fixing it at all. save_knowledge is still the right call for something genuinely new that doesn't already exist. If it's clear which entry he means, just make the change — no need to narrate it as a big procedure. If more than one entry could plausibly be what he means, say what you found and ask which one, rather than picking. Deleting is permanent from your side, so only do it when it's actually clear that's what's wanted, not on a passing or ambiguous remark.`;
     }
-    if (existingContact) {
+    if (isFirstTurn && existingContact) {
       const bits = [];
       if (existingContact.name) bits.push(`Name: ${existingContact.name}`);
       if (existingContact.role_or_work) bits.push(`Role/work: ${existingContact.role_or_work}`);
