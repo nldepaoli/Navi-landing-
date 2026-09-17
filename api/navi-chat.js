@@ -876,13 +876,14 @@ module.exports = async function handler(req, res) {
     const existingContact = isFirstTurn ? await fetchExistingContact(sessionId) : null;
 
     // TEMPORARY diagnostic — remove once the verified_nicholas persistence
-    // issue is actually resolved. Fires only on a returning visit that
-    // isn't currently showing as verified, so it's not noisy for normal
-    // returning visitors in the common case. This exists specifically to
-    // see the raw data Airtable actually returned, rather than continuing
-    // to reason about it from code alone.
-    if (existingContact && !existingContact.verified_nicholas) {
-      sendAlert("DEBUG: returning session, verified_nicholas check", `session_id: ${sessionId}\n\nRaw existingContact fields returned:\n${JSON.stringify(existingContact, null, 2)}`);
+    // issue is actually resolved. Unconditional on isFirstTurn (not gated
+    // on existingContact or verified_nicholas) specifically so silence
+    // can't be misread — the previous version's silence was ambiguous
+    // between "nothing found" and "found, and correctly verified," which
+    // are opposite outcomes. This version always reports the literal
+    // truth: exactly what existingContact is, whatever that turns out to be.
+    if (isFirstTurn) {
+      sendAlert("DEBUG: first-turn existingContact check", `session_id: ${sessionId}\n\nexistingContact was: ${existingContact === null ? "null (nothing found at all)" : JSON.stringify(existingContact, null, 2)}`);
     }
 
     // Real authentication, computed here in code — never something Claude
