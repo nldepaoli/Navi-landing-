@@ -24,16 +24,29 @@
 // Airtable setup: one table (Conversations) with fields — session_id,
 // person_type, name, email, land_or_place, role_or_work, needs, offers,
 // frameworks_mentioned, notes, full_transcript, past_visits_transcript,
-// verified_nicholas, last_updated. full_transcript is always just the
-// current/most recent visit; past_visits_transcript accumulates
-// everything before that, archived once at the start of each new visit
-// (see updateTranscript). verified_nicholas is set once a session says
-// the real-time authentication phrase (env var NICHOLAS_AUTH_PHRASE,
-// set directly in Vercel, never in code) — see saidAuthPhrase. Once
-// verified, PRIVILEGED_TOOLS (edit_knowledge_entry, delete_knowledge_entry)
-// get appended to the tools list for that request only, and Knowledge
-// facts get shown with their real Airtable record IDs so a specific entry
-// can actually be referenced — neither happens for any unverified session.
+// verified_nicholas, verified_member_email, pending_otp_code,
+// pending_otp_expires, pending_otp_email, last_updated. full_transcript
+// is always just the current/most recent visit; past_visits_transcript
+// accumulates everything before that, archived once at the start of each
+// new visit (see updateTranscript). verified_nicholas is set once a
+// session says the real-time authentication phrase (env var
+// NICHOLAS_AUTH_PHRASE, set directly in Vercel, never in code) — see
+// saidAuthPhrase. Once verified, PRIVILEGED_TOOLS (edit_knowledge_entry,
+// delete_knowledge_entry) get appended to the tools list for that
+// request only, and Knowledge facts get shown with their real Airtable
+// record IDs so a specific entry can actually be referenced — neither
+// happens for any unverified session. verified_member_email works the
+// same way but per-GrazeSLO-member rather than a single global flag —
+// set once someone provides a real registered email (checked against
+// GrazeSLO Leads) and reads back a one-time code sent to that address
+// (see sendMemberVerificationCode / confirm_member_code). Once set,
+// MEMBER_SCOPED_TOOLS (update_my_capacity, add_journal_entry,
+// get_my_journal_summary) become available, always scoped to that exact
+// email, never anyone else's. GrazeSLO Leads also gained capacity and
+// capacity_updated_at fields. A new table (Grazing Journal, env var
+// AIRTABLE_JOURNAL_TABLE_NAME) holds member field entries — member_email,
+// date, location, species, headcount, rdm_class, observation, session_id,
+// submitted_at.
 // A second table (Knowledge)
 // with fields — topic, summary, source_type, possible_relation, added_at,
 // expires_at (optional — for time-bound entries like a specific event;
@@ -301,6 +314,71 @@ const PRIVILEGED_TOOLS = [{
       reason: { type: "string", description: "brief note on why this is being removed" },
     },
     required: ["id", "reason"],
+  },
+}];
+
+// The verification pair (request/confirm) is offered to any conversation
+// that isn't yet verified as a specific member — this is the front door.
+// The three scoped tools after them are only ever appended once a real
+// verified_member_email exists for this session (see the call site) —
+// each one operates exclusively on that email's own record, never
+// accepting a different email as an argument, so there's no way for the
+// conversation to redirect them at someone else's data.
+const MEMBER_VERIFICATION_TOOLS = [{
+  name: "request_member_verification",
+  description: "Start verifying someone as a registered GrazeSLO member, by email. Only call this once you have an actual email address to check — don't call it speculatively. If the email isn't found in the registered member list, say so plainly rather than pretending it worked.",
+  input_schema: {
+    type: "object",
+    properties: {
+      email: { type: "string", description: "the email they say they're registered under" },
+    },
+    required: ["email"],
+  },
+}, {
+  name: "confirm_member_code",
+  description: "Check the verification code someone provides against the one just emailed to them. Only call this after request_member_verification has actually been called earlier in this same conversation.",
+  input_schema: {
+    type: "object",
+    properties: {
+      code: { type: "string", description: "the code they typed back" },
+    },
+    required: ["code"],
+  },
+}];
+
+const MEMBER_SCOPED_TOOLS = [{
+  name: "update_my_capacity",
+  description: "Update the verified member's own current capacity or availability. Always applies to their own record — there's no way to update anyone else's from here.",
+  input_schema: {
+    type: "object",
+    properties: {
+      capacity_notes: { type: "string", description: "their current capacity in their own words, e.g. 'open for two more contracts this fall' or 'fully booked through November'" },
+    },
+    required: ["capacity_notes"],
+  },
+}, {
+  name: "add_journal_entry",
+  description: "Log a real field entry for the verified member — a grazing rotation, an observation, a monitoring photo's description. Keep it to what would actually belong in a real range monitoring record: location, species/flock, timing, and what was actually observed (forage condition, RDM class if given, erosion, infrastructure). Not a general diary — event-triggered, not a daily habit to nudge toward.",
+  input_schema: {
+    type: "object",
+    properties: {
+      date: { type: "string", description: "the date this happened, if different from today" },
+      location: { type: "string", description: "the pasture or property name — ideally a consistent, reusable name so entries about the same place can be found and compared later" },
+      species: { type: "string", description: "species/flock or herd involved, if relevant" },
+      headcount: { type: "string", description: "number of animals, if relevant" },
+      rdm_class: { type: "string", description: "light, moderate, or heavy grazing, if they've given a Residual Dry Matter assessment — leave out if not mentioned, never ask for it insistently" },
+      observation: { type: "string", description: "the actual observation in their own words" },
+    },
+    required: ["location", "observation"],
+  },
+}, {
+  name: "get_my_journal_summary",
+  description: "Retrieve the verified member's own past journal entries, optionally filtered to a specific location. Always scoped to their own entries only.",
+  input_schema: {
+    type: "object",
+    properties: {
+      location_filter: { type: "string", description: "optional — only entries mentioning this location" },
+    },
   },
 }];
 
@@ -757,6 +835,99 @@ async function fetchShareableGrazeSloLeads(excludeSessionId) {
   }
 }
 
+// Looks up a real GrazeSLO Leads record by email (case-insensitive) —
+// this is the actual membership check. Being findable here is what makes
+// someone a real member; there's no separate self-registration path.
+async function findGrazeSloMemberByEmail(email) {
+  const base = process.env.AIRTABLE_BASE_ID;
+  const table = encodeURIComponent(process.env.AIRTABLE_GRAZESLO_TABLE_NAME || "GrazeSLO Leads");
+  const headers = { Authorization: `Bearer ${process.env.AIRTABLE_TOKEN}` };
+  const formula = encodeURIComponent(`LOWER({contact_email})="${email.toLowerCase().replace(/"/g, '\\"')}"`);
+  const r = await fetch(`https://api.airtable.com/v0/${base}/${table}?filterByFormula=${formula}&maxRecords=1`, { headers });
+  if (!r.ok) return null;
+  const data = await r.json();
+  const rec = data.records && data.records[0];
+  return rec ? { id: rec.id, fields: rec.fields } : null;
+}
+
+// Generates a 6-digit code, stores it (with a 10-minute expiry) on this
+// session's Conversations row, and emails it to the member's own address
+// — never anywhere else. This is what actually closes the impersonation
+// gap: knowing someone's email isn't enough, reading it from their own
+// inbox is what's actually being verified.
+async function sendMemberVerificationCode(sessionId, email) {
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  await upsertContact(sessionId, { pending_otp_code: code, pending_otp_expires: expires, pending_otp_email: email });
+  if (!process.env.RESEND_API_KEY) return false;
+  try {
+    await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: process.env.FROM_EMAIL || "onboarding@resend.dev",
+        to: email,
+        subject: "Your GrazeSLO verification code",
+        html: `<p>Your code is: <strong style="font-size:20px">${code}</strong></p><p style="color:#888;font-size:12px">This expires in 10 minutes. If you didn't request this, you can ignore it.</p>`,
+      }),
+    });
+    return true;
+  } catch (e) {
+    console.error("Failed to send member verification email:", e);
+    return false;
+  }
+}
+
+async function updateMemberCapacity(memberRecordId, capacityText) {
+  const base = process.env.AIRTABLE_BASE_ID;
+  const table = encodeURIComponent(process.env.AIRTABLE_GRAZESLO_TABLE_NAME || "GrazeSLO Leads");
+  const headers = {
+    Authorization: `Bearer ${process.env.AIRTABLE_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+  await fetch(`https://api.airtable.com/v0/${base}/${table}/${memberRecordId}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ fields: { capacity: capacityText, capacity_updated_at: new Date().toISOString() }, typecast: true }),
+  });
+}
+
+async function addJournalEntry(fields) {
+  const base = process.env.AIRTABLE_BASE_ID;
+  const table = encodeURIComponent(process.env.AIRTABLE_JOURNAL_TABLE_NAME || "Grazing Journal");
+  const headers = {
+    Authorization: `Bearer ${process.env.AIRTABLE_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+  await fetch(`https://api.airtable.com/v0/${base}/${table}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ records: [{ fields: { ...fields, submitted_at: new Date().toISOString() } }], typecast: true }),
+  });
+}
+
+// Scoped entirely to memberEmail — this is what makes get_my_journal_summary
+// safe to expose: it structurally cannot return anyone else's entries,
+// regardless of what's asked for in the conversation.
+async function fetchJournalEntriesForMember(memberEmail, locationFilter) {
+  const base = process.env.AIRTABLE_BASE_ID;
+  const table = encodeURIComponent(process.env.AIRTABLE_JOURNAL_TABLE_NAME || "Grazing Journal");
+  const headers = { Authorization: `Bearer ${process.env.AIRTABLE_TOKEN}` };
+  const formula = encodeURIComponent(`LOWER({member_email})="${memberEmail.toLowerCase().replace(/"/g, '\\"')}"`);
+  const r = await fetch(`https://api.airtable.com/v0/${base}/${table}?pageSize=100&filterByFormula=${formula}`, { headers });
+  if (!r.ok) return [];
+  const data = await r.json();
+  let rows = (data.records || []).map(rec => rec.fields);
+  if (locationFilter) {
+    const needle = locationFilter.toLowerCase();
+    rows = rows.filter(f => f.location && f.location.toLowerCase().includes(needle));
+  }
+  return rows.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+}
+
 // Looks up whether this exact browser (recognized via the session ID
 // persisted in its localStorage) has an existing Conversations record with
 // real content — meaning this isn't a brand-new visitor, it's someone
@@ -775,7 +946,7 @@ async function fetchExistingContact(sessionId) {
     const data = await r.json();
     const f = data.records && data.records[0] && data.records[0].fields;
     if (!f) return null;
-    const hasContent = f.name || f.email || f.land_or_place || f.needs || f.offers || f.notes || f.role_or_work || f.full_transcript || f.past_visits_transcript || f.verified_nicholas;
+    const hasContent = f.name || f.email || f.land_or_place || f.needs || f.offers || f.notes || f.role_or_work || f.full_transcript || f.past_visits_transcript || f.verified_nicholas || f.verified_member_email || f.pending_otp_code;
     return hasContent ? f : null;
   } catch (e) {
     console.error("Existing contact fetch failed:", e);
@@ -899,15 +1070,16 @@ module.exports = async function handler(req, res) {
     const previouslyVerified = !!(existingContact && existingContact.verified_nicholas);
     const isNicholas = saidPhraseThisSession || previouslyVerified;
 
-    // TEMPORARY diagnostic — remove once the multi-turn persistence issue
-    // is actually confirmed resolved. Scoped to authentication-relevant
-    // conversations only (not every conversation), so it isn't noisy for
-    // ordinary visitors, and now fires on every turn of one, not just the
-    // first — the bug just found was specifically about turns after the
-    // first, so this needs to check throughout, not just at the start.
-    if (saidPhraseThisSession || previouslyVerified || (existingContact && existingContact.verified_nicholas)) {
-      sendAlert("DEBUG: existingContact check (turn " + messages.length + ")", `session_id: ${sessionId}\nisFirstTurn: ${isFirstTurn}\nsaidPhraseThisSession: ${saidPhraseThisSession}\npreviouslyVerified (as computed this turn): ${previouslyVerified}\nisNicholas (final): ${isNicholas}\n\nexistingContact was: ${existingContact === null ? "null (nothing found at all)" : JSON.stringify(existingContact, null, 2)}`);
-    }
+    // Member verification state — same existingContact fetch, already
+    // running every turn. verifiedMemberEmail identifies which specific
+    // member this session belongs to (not a single global flag like
+    // isNicholas, since there can be many members). pendingOtp exists
+    // between request_member_verification and confirm_member_code.
+    const verifiedMemberEmail = (existingContact && existingContact.verified_member_email) || null;
+    const pendingOtp = existingContact && existingContact.pending_otp_code
+      ? { code: existingContact.pending_otp_code, expires: existingContact.pending_otp_expires, email: existingContact.pending_otp_email }
+      : null;
+
 
     const [knowledgeBlock, connectionsBlock, grazeSloPoolBlock] = await Promise.all([
       fetchKnowledge(isNicholas),
@@ -955,6 +1127,13 @@ module.exports = async function handler(req, res) {
 
 You also have edit_knowledge_entry and delete_knowledge_entry available right now — only in this verified conversation, never otherwise. Each known fact below is shown with its own [id:...] tag; that's the exact identifier to use, never guessed or constructed. If he's correcting, updating, or removing something that already exists in your known facts, use edit_knowledge_entry or delete_knowledge_entry on that exact entry — do NOT call save_knowledge to add a new "correction" note alongside the original, since that just leaves both the wrong version and the fix sitting there as two separate facts, which is worse than not fixing it at all. save_knowledge is still the right call for something genuinely new that doesn't already exist. If it's clear which entry he means, just make the change — no need to narrate it as a big procedure. If more than one entry could plausibly be what he means, say what you found and ask which one, rather than picking. Deleting is permanent from your side, so only do it when it's actually clear that's what's wanted, not on a passing or ambiguous remark.`;
     }
+    if (verifiedMemberEmail) {
+      systemPrompt += `\n\nThis conversation is verified as a specific registered GrazeSLO member (${verifiedMemberEmail}) — confirmed by them reading a code from their own email, not something you inferred. You have update_my_capacity, add_journal_entry, and get_my_journal_summary available — all of them apply only to this person's own record, structurally, regardless of what's discussed. If this is a returning member and you haven't already said something similar earlier in this conversation, it's worth proactively naming what you can do for them early on — something like offering to log today's rotation, check their capacity, or pull up their own history — rather than waiting for them to guess what's possible. Don't repeat that offer every single turn once you've made it once.
+
+For journal entries specifically: keep it to what would actually belong in a real range monitoring record — location (ideally a consistent, reusable name for the same spot over time), species/flock, timing, and the actual observation (forage condition, RDM class if they give you one, erosion, infrastructure changes). This isn't a general diary, and don't nudge them to log on any kind of schedule — event-triggered only, when something actually happened worth noting. If someone's documenting a spot for the first time, it's worth coaching briefly toward real photo-point practice if a photo comes up: roughly the same spot each time, ideally something for scale in frame. If they mention Residual Dry Matter or ask what to report, the real field categories are light, moderate, or heavy grazing — that's the actual standard used in California rangeland monitoring, not something invented for this.`;
+    } else if (pendingOtp) {
+      systemPrompt += `\n\nA verification code was just sent to ${pendingOtp.email} — if they give you a code, call confirm_member_code with it. Don't ask them to repeat their email again; you're just waiting on the code now.`;
+    }
     if (isFirstTurn && existingContact) {
       const bits = [];
       if (existingContact.name) bits.push(`Name: ${existingContact.name}`);
@@ -986,7 +1165,12 @@ You also have edit_knowledge_entry and delete_knowledge_entry available right no
     // several tool calls (log_contact, save_knowledge, a search) before she
     // actually replies, and running out mid-loop should never look like a
     // hard failure.
-    const activeTools = isNicholas ? [...TOOLS, ...PRIVILEGED_TOOLS] : TOOLS;
+    const activeTools = [
+      ...TOOLS,
+      ...(isNicholas ? PRIVILEGED_TOOLS : []),
+      ...MEMBER_VERIFICATION_TOOLS,
+      ...(verifiedMemberEmail ? MEMBER_SCOPED_TOOLS : []),
+    ];
     for (let i = 0; i < 8; i++) {
       const data = await callClaude(convo, systemPrompt, activeTools);
       const content = data.content || [];
@@ -1157,6 +1341,93 @@ You also have edit_knowledge_entry and delete_knowledge_entry available right no
               console.error("delete_knowledge_entry failed:", e);
               toolResultContent.set(t.id, "That didn't go through — something went wrong.");
               sendAlert("Knowledge delete failed", `A delete attempt failed.\n\nWHAT WAS ATTEMPTED:\n${JSON.stringify(t.input, null, 2)}\n\nSession: ${sessionId}\n\nError: ${e && e.stack ? e.stack : e}`);
+            }
+          }
+        } else if (t.name === "request_member_verification") {
+          const email = t.input && t.input.email;
+          if (!email) {
+            toolResultContent.set(t.id, "No email given.");
+          } else {
+            try {
+              const member = await findGrazeSloMemberByEmail(email);
+              if (!member) {
+                toolResultContent.set(t.id, "That email isn't in the registered member list.");
+              } else {
+                const sent = await sendMemberVerificationCode(sessionId, email);
+                toolResultContent.set(t.id, sent ? "A code was sent to that email." : "Found the member, but the email failed to send — something went wrong.");
+              }
+            } catch (e) {
+              console.error("request_member_verification failed:", e);
+              toolResultContent.set(t.id, "Something went wrong checking that.");
+            }
+          }
+        } else if (t.name === "confirm_member_code") {
+          const code = t.input && t.input.code;
+          if (!pendingOtp) {
+            toolResultContent.set(t.id, "No verification is currently pending — ask for their email again first.");
+          } else if (new Date(pendingOtp.expires) < new Date()) {
+            toolResultContent.set(t.id, "That code has expired — they'll need to request a new one.");
+          } else if (code !== pendingOtp.code) {
+            toolResultContent.set(t.id, "That code doesn't match.");
+          } else {
+            try {
+              await upsertContact(sessionId, { verified_member_email: pendingOtp.email, pending_otp_code: "", pending_otp_expires: "", pending_otp_email: "" });
+              toolResultContent.set(t.id, "Verified.");
+            } catch (e) {
+              console.error("confirm_member_code save failed:", e);
+              toolResultContent.set(t.id, "The code matched, but saving that didn't go through — something went wrong.");
+            }
+          }
+        } else if (t.name === "update_my_capacity") {
+          // Re-checked here, not just relied on via tool availability —
+          // same defense-in-depth pattern as the privileged tools above.
+          if (!verifiedMemberEmail) {
+            toolResultContent.set(t.id, "This isn't available right now.");
+          } else {
+            try {
+              const member = await findGrazeSloMemberByEmail(verifiedMemberEmail);
+              if (!member) {
+                toolResultContent.set(t.id, "Couldn't find their member record.");
+              } else {
+                await updateMemberCapacity(member.id, t.input && t.input.capacity_notes);
+                toolResultContent.set(t.id, "Updated.");
+              }
+            } catch (e) {
+              console.error("update_my_capacity failed:", e);
+              toolResultContent.set(t.id, "That didn't save — something went wrong.");
+            }
+          }
+        } else if (t.name === "add_journal_entry") {
+          if (!verifiedMemberEmail) {
+            toolResultContent.set(t.id, "This isn't available right now.");
+          } else {
+            try {
+              // member_email always comes from the verified session, never
+              // from the tool input — this is what makes it structurally
+              // impossible to log an entry under someone else's name.
+              await addJournalEntry({ ...t.input, member_email: verifiedMemberEmail, session_id: sessionId });
+              toolResultContent.set(t.id, "Logged.");
+            } catch (e) {
+              console.error("add_journal_entry failed:", e);
+              toolResultContent.set(t.id, "That didn't save — something went wrong.");
+              sendAlert("Journal entry failed to save — data below can be added by hand", `WHAT WAS BEING SAVED:\n${JSON.stringify({ ...t.input, member_email: verifiedMemberEmail }, null, 2)}\n\nSession: ${sessionId}\n\nError: ${e && e.stack ? e.stack : e}`);
+            }
+          }
+        } else if (t.name === "get_my_journal_summary") {
+          if (!verifiedMemberEmail) {
+            toolResultContent.set(t.id, "This isn't available right now.");
+          } else {
+            try {
+              const entries = await fetchJournalEntriesForMember(verifiedMemberEmail, t.input && t.input.location_filter);
+              if (!entries.length) {
+                toolResultContent.set(t.id, "No journal entries found yet.");
+              } else {
+                const formatted = entries.map(e => `- ${e.date || e.submitted_at}: ${e.location} — ${e.species || ""} ${e.headcount ? `(${e.headcount})` : ""} ${e.rdm_class ? `[${e.rdm_class}]` : ""} — ${e.observation}`).join("\n");
+                toolResultContent.set(t.id, formatted);
+              }
+            } catch (e) {
+              console.error("get_my_journal_summary failed:", e);
+              toolResultContent.set(t.id, "Couldn't retrieve that right now.");
             }
           }
         } else if (t.name === "end_conversation") {
