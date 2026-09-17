@@ -5,6 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Navi — coming soon</title>
   <meta name="description" content="A living map of SLO County's commons is being built. Navi will be your guide." />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#07090a" />
+  <!-- iOS specifically ignores the manifest for standalone launch behavior
+       and needs its own meta tags — these are what make Add to Home
+       Screen actually launch full-screen instead of just opening Safari. -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Navi" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
   <style>
     html, body { margin:0; padding:0; background:#07090a; }
     #root { min-height:100vh; }
@@ -14,5 +23,12 @@
   <div id="root"></div>
   <script src="bundle.js"></script>
   <script defer src="/_vercel/insights/script.js"></script>
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("/sw.js").catch(() => {});
+      });
+    }
+  </script>
 </body>
 </html>
