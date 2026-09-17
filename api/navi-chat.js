@@ -875,6 +875,16 @@ module.exports = async function handler(req, res) {
     // delete anything) depends on isNicholas, which depends on this.
     const existingContact = isFirstTurn ? await fetchExistingContact(sessionId) : null;
 
+    // TEMPORARY diagnostic — remove once the verified_nicholas persistence
+    // issue is actually resolved. Fires only on a returning visit that
+    // isn't currently showing as verified, so it's not noisy for normal
+    // returning visitors in the common case. This exists specifically to
+    // see the raw data Airtable actually returned, rather than continuing
+    // to reason about it from code alone.
+    if (existingContact && !existingContact.verified_nicholas) {
+      sendAlert("DEBUG: returning session, verified_nicholas check", `session_id: ${sessionId}\n\nRaw existingContact fields returned:\n${JSON.stringify(existingContact, null, 2)}`);
+    }
+
     // Real authentication, computed here in code — never something Claude
     // itself decides. saidPhraseThisSession catches it within the current
     // conversation (the phrase stays in the message history for the rest
